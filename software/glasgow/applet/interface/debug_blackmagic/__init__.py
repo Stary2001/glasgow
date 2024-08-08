@@ -171,8 +171,7 @@ class BlackmagicApplet(GlasgowApplet):
             help="set SWCLK frequency to FREQ kHz (default: %(default)s)")
 
     def build(self, target, args):
-        self.frequency = args.frequency
-        print(args.frequency)
+        self.frequency = args.frequency * 1000
 
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
         iface.add_subtarget(BlackmagicSubtarget(
@@ -220,7 +219,6 @@ class BlackmagicApplet(GlasgowApplet):
             chunk = await asyncio.get_event_loop().run_in_executor(None, lambda: os.read(master, 1024))
 
             for cmd in consume_commands(chunk):
-                #print(cmd)
                 code = cmd[0:2]
                 # General: start
                 if code == b"GA":
@@ -229,7 +227,9 @@ class BlackmagicApplet(GlasgowApplet):
                     reply(REMOTE_RESP_OK, b"Glasgow")
                 elif code == b"Gf":
                     # General: get clock frequency
-                    reply(REMOTE_RESP_OK, (self.frequency * 1000).to_bytes(4, 'little').hex().encode('ascii'))
+                    # This is in little endian, because the firmware does
+                    # remote_respond_buf(REMOTE_RESP_OK, (uint8_t *)&freq, 4);
+                    reply(REMOTE_RESP_OK, self.frequency.to_bytes(4, 'little').hex().encode('ascii'))
                 elif code == b"GF":
                     # General: set clock frequency
                     clock_freq = int(cmd[2:], 16)
