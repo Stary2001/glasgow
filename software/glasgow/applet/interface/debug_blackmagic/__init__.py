@@ -162,6 +162,78 @@ REMOTE_RESP_NOTSUP = b'N'
 #define jtagtap_return_idle(cycles) jtag_proc.jtagtap_tms_seq(0x01, (cycles) + 1U)
 # """
 
+class SWDInterface:
+    def __init__(self, lower):
+        self.lower = lower
+        self.line_dir = False
+
+    async def turnaround(self, newdir):
+        if self.line_dir == newdir:
+            return
+        self.line_dir = newdir
+
+        if not newdir:
+            await self.lower.write(b"".join([SWDIO_FLOAT, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
+        else:
+            await self.lower.write(b"".join([WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW, SWDIO_DRIVE]))
+
+    async def led(self, state):
+        if state:
+            await self.lower.write(b"B")
+        else:
+            await self.lower.write(b"b")
+    
+    async def swd_out(self, num_clocks, data, parity=False):
+        await self.turnaround(True)
+
+        for i in range(0, num_clocks):
+            if data & (1<<i):
+                await self.lower.write(b"".join([SWDIO_HIGH, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
+            else:
+                await self.lower.write(b"".join([SWDIO_LOW, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
+
+        # Write parity bit
+        if parity:
+            if (data.bit_count() & 1) == 1:
+                await self.lower.write(b"".join([SWDIO_HIGH, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
+            else:
+                await self.lower.write(b"".join([SWDIO_LOW, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
+
+        await self.lower.flush()
+
+    async def swd_in(self, num_clocks, parity=False):
+        # SWD: in %02x clocks
+        await self.turnaround(False)
+
+        num_clocks_with_parity = num_clocks
+        if parity:
+            num_clocks_with_parity = num_clocks + 1
+
+        await self.lower.write(b"".join([WAIT, SWDIO_READ, SWCLK_HIGH, WAIT, SWCLK_LOW]) * num_clocks_with_parity)
+
+        data_u32 = 0
+        data = await self.lower.read(num_clocks_with_parity)
+
+        # TODO: i am pretty sure this is just a bit reverse
+        for i in range(0, num_clocks):
+            data_u32 >>= 1
+            if data[i] == b"1"[0]:
+                data_u32 |= (1<<31)
+        data_u32 >>= (32-num_clocks)
+
+        if parity:
+            await self.turnaround(True)
+            if (data_u32.bit_count() & 1) != (data[num_clocks] & 1):
+                # Parity error
+                return (True, data_u32)
+        return (False, data_u32)
+
+class BlackmagicInterface:
+    # todo
+    def __init__(self, swd_iface, jtag_iface):
+        self.swd = swd_iface
+        self.jtag = jtag_iface
+
 class BlackmagicApplet(GlasgowApplet):
     logger = logging.getLogger(__name__)
     help = "expose bitbang interface for BMP"
@@ -176,8 +248,8 @@ class BlackmagicApplet(GlasgowApplet):
     def add_build_arguments(cls, parser, access):
         super().add_build_arguments(parser, access)
 
-        access.add_pin_argument(parser, "swclk", default=True)
         access.add_pin_argument(parser, "swdio", default=True)
+        access.add_pin_argument(parser, "swclk", default=True)
 
         access.add_pin_argument(parser, "srst")
 
@@ -202,27 +274,19 @@ class BlackmagicApplet(GlasgowApplet):
         ))
 
     async def run(self, device, args):
-        return await device.demultiplexer.claim_interface(self, self.mux_interface, args)
+        iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args)
+        #jtag_iface = JTAGProbeInterface(iface, self.logger, has_trst=args.pin_trst is not None)
+        swd_iface = SWDInterface(iface)
+        bmp_iface = BlackmagicInterface(swd_iface, None)
+        return bmp_iface
 
     @classmethod
     def add_interact_arguments(cls, parser):
         pass
 
-    async def interact(self, device, args, iface):
+    async def interact(self, device, args, iface: BlackmagicInterface):
         master, slave = pty.openpty()
         print(os.ttyname(slave))
-
-        line_dir = False
-        async def turnaround(newdir):
-            nonlocal line_dir
-            if line_dir == newdir:
-                return
-            line_dir = newdir
-
-            if not newdir:
-                await iface.write(b"".join([SWDIO_FLOAT, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
-            else:
-                await iface.write(b"".join([WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW, SWDIO_DRIVE]))
 
         def reply(resp, *args):
             os.write(master, b"&" + resp + b"".join(args) + b"#")
@@ -237,7 +301,7 @@ class BlackmagicApplet(GlasgowApplet):
                 code = cmd[0:2]
                 # General: start
                 if code == b"GA":
-                    await iface.write(b"B")
+                    await iface.swd.led(True)
                     # Return probe name
                     reply(REMOTE_RESP_OK, b"Glasgow")
                 elif code == b"Gf":
@@ -320,59 +384,22 @@ class BlackmagicApplet(GlasgowApplet):
                     pass
                 elif code == b"SS":
                     # SWD: init
-                    await turnaround(False)
+                    await iface.swd.turnaround(False)
                     reply_int(REMOTE_RESP_OK, 0)
                 elif code == b"So" or code == b"SO":
-                    # SWD: out %02x clocks + %x data
-                    await turnaround(True)
-
                     num_clocks = int(cmd[2:4], 16)
                     data = int(cmd[4:], 16)
-                    for i in range(0, num_clocks):
-                        if data & (1<<i):
-                            await iface.write(b"".join([SWDIO_HIGH, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
-                        else:
-                            await iface.write(b"".join([SWDIO_LOW, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
 
-                    # Write parity bit
-                    if code == b"SO":
-                        if (data.bit_count() & 1) == 1:
-                            await iface.write(b"".join([SWDIO_HIGH, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
-                        else:
-                            await iface.write(b"".join([SWDIO_LOW, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
-
-                    await iface.flush()
+                    await iface.swd.swd_out(num_clocks, data, parity=(code == b"SO"))
                     reply_int(REMOTE_RESP_OK, 0)
                 elif code == b"Si" or code == b"SI":
-                    # SWD: in %02x clocks
-                    await turnaround(False)
-
                     num_clocks = int(cmd[2:4], 16)
-                    if code == b"Si":
-                        num_clocks_with_parity = num_clocks
+                    parity_error, data = await iface.swd.swd_in(num_clocks, parity=(code == b"SI"))
+                    if parity_error:
+                        reply(REMOTE_RESP_PARERR, hex(data)[2:].encode("utf-8"))
                     else:
-                        num_clocks_with_parity = num_clocks + 1
+                        reply(REMOTE_RESP_OK, hex(data)[2:].encode("utf-8"))
 
-                    await iface.write(b"".join([WAIT, SWDIO_READ, SWCLK_HIGH, WAIT, SWCLK_LOW]) * num_clocks_with_parity)
-
-                    data_u32 = 0
-                    data = await iface.read(num_clocks_with_parity)
-
-                    # TODO: i am pretty sure this is just a bit reverse
-                    for i in range(0, num_clocks):
-                        data_u32 >>= 1
-                        if data[i] == b"1"[0]:
-                            data_u32 |= (1<<31)
-                    data_u32 >>= (32-num_clocks)
-
-                    if code == b"SI":
-                        await turnaround(True)
-                        if (data_u32.bit_count() & 1) != (data[num_clocks] & 1):
-                            # Parity error
-                            os.write(master, b"&"+REMOTE_RESP_PARERR+b"#")
-                            continue
-
-                    reply(REMOTE_RESP_OK, hex(data_u32)[2:].encode("utf-8"))
                 else:
                     print("Unknown", cmd)
                     reply(REMOTE_RESP_ERR, REMOTE_ERROR_UNRECOGNISED)
