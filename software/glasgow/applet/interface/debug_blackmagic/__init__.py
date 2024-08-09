@@ -147,6 +147,21 @@ REMOTE_RESP_PARERR = b'P'
 REMOTE_RESP_ERR    = b'E'
 REMOTE_RESP_NOTSUP = b'N'
 
+"""
+
+/* generic soft reset: 1, 1, 1, 1, 1, 0 */
+#define jtagtap_soft_reset() jtag_proc.jtagtap_tms_seq(0x1fU, 6)
+
+/* Goto Shift-IR: 1, 1, 0, 0 */
+#define jtagtap_shift_ir() jtag_proc.jtagtap_tms_seq(0x03U, 4)
+
+/* Goto Shift-DR: 1, 0, 0 */
+#define jtagtap_shift_dr() jtag_proc.jtagtap_tms_seq(0x01U, 3)
+
+/* Goto Run-test/Idle: 1, 1, 0 */
+#define jtagtap_return_idle(cycles) jtag_proc.jtagtap_tms_seq(0x01, (cycles) + 1U)
+# """
+
 class BlackmagicApplet(GlasgowApplet):
     logger = logging.getLogger(__name__)
     help = "expose bitbang interface for BMP"
@@ -261,6 +276,48 @@ class BlackmagicApplet(GlasgowApplet):
                     # Highlevel: what accelerations are available?
                     # Return no acceleration.
                     os.write(master, b"&K0#")
+                elif code == b"JS":
+                    # JTAG: Start
+                    # jtagtap_init()
+                    """	/* Ensure we're in JTAG mode */
+                    for (size_t i = 0; i <= 50U; ++i)
+                        jtagtap_next(true, false); /* 50 + 1 idle cycles for SWD reset */
+                    jtagtap_tms_seq(0xe73cU, 16U); /* SWD to JTAG sequence */"""
+                    pass
+                elif code == b"JR":
+                    # JTAG: Reset
+                    # jtagtap_reset()
+                    jtagtap_tms_seq(0x1f, 6)
+                elif code == b"JT":
+                    # JTAG: tms sequence
+                    # obvious: jtagprobe CMD_SHIFT_TMS
+                    clock_cycles = int(cmd[2:4], 16)
+                    tms_states = int(cmd[4:6], 16)
+                    # jtagtap_tms_seq(tms_states, clock_cycles)
+                    pass
+                elif code == b"JC":
+                    # JTAG: clock
+                    # this seems to be unused?
+                    tms_state = cmd[2:2] != b"0"
+                    tdi_state = cmd[3:3] != b"0"
+                    clock_cycles = int(cmd[4:6], 16)
+                    raise RuntimeError("we hope jtagtap_cycle is never called")
+                    pass
+                elif code == b"JD" or code == b"Jd":
+                    # JTAG: REMOTE_TDITDO_TMS or REMOTE_TDITDO_NOTMS
+                    # jtag applet only has tms version?
+                    # oh. no shit. just last=False
+                    clock_cycles = int(cmd[2:4], 16)
+                    data = int(cmd[4:], 16)
+                    # jtagtap_tdi_tdo_seq()
+                elif code == b"JN":
+                    # JTAG: Next bit
+                    # This seems to not exist, we need to hack it
+                    # set tdi, tms, set clk high, read tdo, set clk low
+                    # tdio(0,) or tdio(1,) with last=False/True (tms state)
+
+                    # jtagtap_next(packet[2] == '1', packet[3] == '1');
+                    pass
                 elif code == b"SS":
                     # SWD: init
                     await turnaround(False)
