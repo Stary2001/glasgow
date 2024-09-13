@@ -219,6 +219,18 @@ class SWDBlackmagicRemote(BlackmagicRemote):
     async def swd_in(self, num_clocks, use_parity):
         return await self.iface.swd_in(num_clocks, use_parity)
 
+    async def jtag_reset(self):
+        raise NotImplementedError()
+    
+    async def jtag_shift_tms(self, tms_states, clock_cycles):
+        raise NotImplementedError()
+    
+    async def jtag_tdi_tdo_seq(self, clock_cycles, data, last):
+        raise NotImplementedError()
+    
+    async def jtag_next_bit(self, tms_state, tdi_state):
+        raise NotImplementedError()
+
 class SWDBlackmagicApplet(GlasgowApplet):
     logger = logging.getLogger(__name__)
     help = "expose bitbang interface for BMP"

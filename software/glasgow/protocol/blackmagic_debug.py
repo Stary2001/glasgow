@@ -53,6 +53,22 @@ class BlackmagicRemote(metaclass=ABCMeta):
     async def swd_in(self, num_clocks, parity):
         pass
 
+    @abstractmethod
+    async def jtag_reset(self):
+        pass
+    
+    @abstractmethod
+    async def jtag_shift_tms(self, tms_states, clock_cycles):
+        pass
+    
+    @abstractmethod
+    async def jtag_tdi_tdo_seq(self, clock_cycles, data, last):
+        pass
+    
+    @abstractmethod
+    async def jtag_next_bit(self, tms_state, tdi_state):
+        pass
+
     async def run(self, pty):
         def reply(resp, *args):
             os.write(pty, b"&" + resp + b"".join(args) + b"#")
@@ -84,8 +100,10 @@ class BlackmagicRemote(metaclass=ABCMeta):
                     # General: set clock OE
                     # TODO: always on for now
                     # either 0/1
+                    print("TODO: Set clock OE")
                     reply_int(REMOTE_RESP_OK, 0)
                 elif code == b"Gp" or code == b"GP":
+                    print("TODO: Set target power")
                     # General: set/get power switch
                     # Report not supported for power switch for now
                     reply(REMOTE_RESP_NOTSUP)
@@ -94,18 +112,20 @@ class BlackmagicRemote(metaclass=ABCMeta):
                     reply(REMOTE_RESP_OK, b"at least 2")
                 elif code == b"Gz":
                     # Return value of nRST
+                    print("TODO: get nRST")
                     reply_int(REMOTE_RESP_OK, 1)
                 elif code == b"GZ":
                     # Set nRST to next byte
+                    print("TODO: set nRST")
                     reply_int(REMOTE_RESP_OK, 0)
                 elif code == b"HC":
                     # Highlevel: check
                     # return protocol version v4
-                    os.write(pty, b"&K4#")
+                    reply_int(REMOTE_RESP_OK, 4)
                 elif code == b"HA":
                     # Highlevel: what accelerations are available?
                     # Return no acceleration.
-                    os.write(pty, b"&K0#")
+                    reply_int(REMOTE_RESP_OK, 0)
                 elif code == b"SS":
                     # SWD: init
                     await self.swd_turnaround(False)
@@ -120,10 +140,49 @@ class BlackmagicRemote(metaclass=ABCMeta):
                     num_clocks = int(cmd[2:4], 16)
                     parity_error, data = await self.swd_in(num_clocks, use_parity=(code == b"SI"))
                     if parity_error:
-                        reply(REMOTE_RESP_PARERR, hex(data)[2:].encode("utf-8"))
+                        reply_int(REMOTE_RESP_PARERR, data)
                     else:
-                        reply(REMOTE_RESP_OK, hex(data)[2:].encode("utf-8"))
+                        reply_int(REMOTE_RESP_OK, data)
+                elif code == b"JS":
+                    reply_int(REMOTE_RESP_OK, 0)
+                elif code == b"JR":
+                    # JTAG: Reset
 
+                    await self.jtag_reset()
+                    reply_int(REMOTE_RESP_OK, 0)
+                elif code == b"JT":
+                    # JTAG: tms sequence
+
+                    clock_cycles = int(cmd[2:4], 16)
+                    tms_states = int(cmd[4:6], 16)
+                    await self.jtag_shift_tms(tms_states, clock_cycles)
+                    reply_int(REMOTE_RESP_OK, 0)
+                elif code == b"JC":
+                    # JTAG: clock
+                    # this seems to be unused?
+                    tms_state = cmd[2:2] != b"0"
+                    tdi_state = cmd[3:3] != b"0"
+                    clock_cycles = int(cmd[4:6], 16)
+                    raise RuntimeError("we hope jtagtap_cycle is never called")
+                elif code == b"JD" or code == b"Jd":
+                    clock_cycles = int(cmd[2:4], 16)
+                    data = int(cmd[4:], 16)
+
+                    # JD = tms set
+                    # Jd = tms not set
+                    bits = await self.jtag_tdi_tdo_seq(clock_cycles, data, last=(code == b"JD"))
+                    data = 0
+                    for i, x in enumerate(bits):
+                        data |= x << i
+                    reply_int(REMOTE_RESP_OK, data)
+                elif code == b"JN":
+                    # JTAG: Next bit
+
+                    result = await self.jtag_next_bit(cmd[2:3] == b'1', cmd[3:4] == b'1')
+                    reply_int(REMOTE_RESP_OK, result[0])
+                elif code == b"HJ":
+                    # Ignore
+                    reply_int(REMOTE_RESP_OK, 0)
                 else:
                     print("Unknown", cmd)
                     reply(REMOTE_RESP_ERR, REMOTE_ERROR_UNRECOGNISED)
