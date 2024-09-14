@@ -61,17 +61,26 @@ class JTAGBlackmagicRemote(BlackmagicRemote):
     async def jtag_shift_tms(self, tms_states, clock_cycles):
         # This is silly, but the JTAG applet checks its state...
 
-        # Going into IDLE normally.
         if clock_cycles == 2 and tms_states == 0x01:
+            # Go into IDLE.
             await self.iface.enter_run_test_idle()
-        elif clock_cycles >= 3 and tms_states == 0x01:
-            # RISC-V support requires waiting in run-test/idle, but the bits are the same
-            # for exiting EXIT-DR as entering SHIFT-DR from IDLE. Use the state to disambiguate these.
+        elif clock_cycles == 3 and tms_states == 0x01:
+            # Two operations have the same representation:
+            # Going into idle from drexit1, and wait for one idle clock
+            # Going into shift-dr from idle
+            # Use the state to disambiguate these.
+
             if self.iface._state == JTAGState.DREXIT1:
-                await self.iface.run_test_idle(clock_cycles - 2)
+                await self.enter_run_test_idle()
+                await self.pulse_tck(clock_cycles-2)
             else:
                 await self.iface.enter_shift_dr()
+        elif clock_cycles >= 4 and tms_states == 0x01:
+            # Go into IDLE, and wait for two+ cycles.
+            await self.enter_run_test_idle()
+            await self.pulse_tck(clock_cycles-2)
         elif clock_cycles == 4 and tms_states == 0x03:
+            # Go into shift-ir
             await self.iface.enter_shift_ir()
         else:
             raise NotImplementedError("Unimplemented TMS transition!")
