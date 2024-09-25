@@ -16,6 +16,11 @@ REMOTE_RESP_PARERR = b'P'
 REMOTE_RESP_ERR    = b'E'
 REMOTE_RESP_NOTSUP = b'N'
 
+REMOTE_ACCEL_ADIV5     = 1 << 0
+REMOTE_ACCEL_CORTEX_AR = 1 << 1
+REMOTE_ACCEL_RISCV     = 1 << 2
+REMOTE_ACCEL_ADIV6     = 1 << 3
+
 def consume_commands(s):
     start = None
     for i in range(0, len(s)):
@@ -35,6 +40,14 @@ class BlackmagicRemote(metaclass=ABCMeta):
 
     @abstractmethod
     def set_current_frequency(self, freq):
+        pass
+
+    @abstractmethod
+    async def get_nrst(self):
+        pass
+
+    @abstractmethod
+    async def set_nrst(self, state):
         pass
 
     @abstractmethod
@@ -112,11 +125,12 @@ class BlackmagicRemote(metaclass=ABCMeta):
                     reply(REMOTE_RESP_OK, b"at least 2")
                 elif code == b"Gz":
                     # Return value of nRST
-                    print("TODO: get nRST")
-                    reply_int(REMOTE_RESP_OK, 1)
+                    nrst_value = await self.get_nrst()
+                    reply_int(REMOTE_RESP_OK, 1 if nrst_value else 0)
                 elif code == b"GZ":
                     # Set nRST to next byte
-                    print("TODO: set nRST")
+                    nrst_value = int(cmd[2:3])
+                    await self.set_nrst(nrst_value == 1)
                     reply_int(REMOTE_RESP_OK, 0)
                 elif code == b"HC":
                     # Highlevel: check

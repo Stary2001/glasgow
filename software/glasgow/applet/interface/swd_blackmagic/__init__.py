@@ -106,7 +106,7 @@ class BlackmagicSubtarget(Elaboratable):
                     with m.Case(*b"fg"):
                         m.d.sync += bus.swdio_o.eq(out_fifo.r_data[0])
                     # remote_bitbang_reset(int trst, int srst)
-                    with m.Case(*b"rstu"):
+                    with m.Case(*b"rs"):
                         m.d.sync += self.srst_o.eq(out_fifo.r_data - ord(b"r"))
                     # remote_bitbang_blink(int on)
                     with m.Case(*b"Bb"):
@@ -134,6 +134,7 @@ class SWDInterface:
     def __init__(self, lower):
         self.lower = lower
         self.line_dir = False
+        self.nrst = True
 
     async def turnaround(self, newdir):
         if self.line_dir == newdir:
@@ -145,7 +146,19 @@ class SWDInterface:
         else:
             await self.lower.write(b"".join([WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW, SWDIO_DRIVE]))
 
-    async def led(self, state):
+    async def get_nrst(self):
+        return self.nrst
+
+    # Invert this here. state = True means is in reset.
+    async def set_nrst(self, state):
+        if state:
+            self.nrst = True
+            await self.lower.write(b"r")
+        else:
+            self.nrst = False
+            await self.lower.write(b"s")
+
+    async def set_led(self, state):
         if state:
             await self.lower.write(b"B")
         else:
@@ -207,8 +220,14 @@ class SWDBlackmagicRemote(BlackmagicRemote):
     def set_current_frequency(self, freq):
         pass
 
+    async def get_nrst(self):
+        return await self.iface.get_nrst()
+
+    async def set_nrst(self, state):
+        await self.iface.set_nrst(state)
+
     async def set_led(self, state):
-        await self.iface.led(state)
+        await self.iface.set_led(state)
     
     async def swd_turnaround(self, direction):
         await self.iface.turnaround(direction)

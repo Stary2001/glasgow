@@ -28,6 +28,12 @@ class JTAGBlackmagicRemote(BlackmagicRemote):
     def set_current_frequency(self, freq):
         pass
 
+    async def get_nrst(self):
+        pass
+
+    async def set_nrst(self, state):
+        pass
+
     async def set_led(self, state):
         pass
     
