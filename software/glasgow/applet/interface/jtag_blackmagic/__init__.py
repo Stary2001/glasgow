@@ -62,14 +62,14 @@ class JTAGBlackmagicRemote(BlackmagicRemote):
             # Use the state to disambiguate these.
 
             if self.iface._state == JTAGState.DREXIT1:
-                await self.enter_run_test_idle()
-                await self.pulse_tck(clock_cycles-2)
+                await self.iface.enter_run_test_idle()
+                await self.iface.pulse_tck(clock_cycles-2)
             else:
                 await self.iface.enter_shift_dr()
         elif clock_cycles >= 4 and tms_states == 0x01:
             # Go into IDLE, and wait for two+ cycles.
-            await self.enter_run_test_idle()
-            await self.pulse_tck(clock_cycles-2)
+            await self.iface.enter_run_test_idle()
+            await self.iface.pulse_tck(clock_cycles-2)
         elif clock_cycles == 4 and tms_states == 0x03:
             # Go into shift-ir
             await self.iface.enter_shift_ir()

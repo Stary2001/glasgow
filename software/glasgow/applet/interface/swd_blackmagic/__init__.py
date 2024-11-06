@@ -38,6 +38,15 @@ class SWDProbeBus(Elaboratable):
         ]
         return m
 
+CMD_MASK       = 0b0000_1111
+CMD_TURNAROUND = 0
+FLAGS_MASK       = 0b1111_0000
+TURNAROUND_IN = 0 << 4
+TURNAROUND_OUT = 1 << 4
+
+CMD_SWD_IN = 1
+CMD_SWD_OUT  = 2
+CMD_SWD_GPIO  = 3
 
 class BlackmagicSubtarget(Elaboratable):
     def __init__(self, ports, out_fifo, in_fifo, period_cyc, us_cyc):
@@ -83,51 +92,140 @@ class BlackmagicSubtarget(Elaboratable):
         except:
             pass
 
+        cmd_plus_flags = Signal(8)
+        cmd_only = Signal(4)
+        flags_only = Signal(8)
+        m.d.comb += cmd_only.eq(cmd_plus_flags & CMD_MASK)
+        m.d.comb += flags_only.eq(cmd_plus_flags & FLAGS_MASK)
+
+        in_bit = Signal()
+        seq_length = Signal(8)
+        seq_length_counter = Signal(8)
+        seq_data = Signal(32)
+
+        seq_counter = Signal(range(5))
+
         timer = Signal(range(max(self.period_cyc, 1000 * self.us_cyc)))
-        with m.If(timer != 0):
-            m.d.sync += timer.eq(timer - 1)
-        with m.Else():
-            with m.If(out_fifo.r_rdy):
-                m.d.comb += out_fifo.r_en.eq(1)
-                with m.Switch(out_fifo.r_data):
-                    # remote_bitbang_swdio_drive(int is_output)
-                    with m.Case(*b"Oo"):
-                        m.d.sync += bus.swdio_z.eq(out_fifo.r_data[5])
-                    # remote_bitbang_swdio_read()
-                    with m.Case(*b"c"):
-                        m.d.comb += out_fifo.r_en.eq(in_fifo.w_rdy)
-                        m.d.comb += in_fifo.w_en.eq(1)
-                        m.d.comb += in_fifo.w_data.eq(b"0"[0] | Cat(bus.swdio_i))
-                    # write swclk
-                    with m.Case(*b"de"):
-                        m.d.sync += bus.swclk.eq(out_fifo.r_data[0])
-                        #m.d.sync += timer.eq(self.period_cyc - 1)
-                    # write swdio
-                    with m.Case(*b"fg"):
-                        m.d.sync += bus.swdio_o.eq(out_fifo.r_data[0])
-                    # remote_bitbang_reset(int trst, int srst)
-                    with m.Case(*b"rs"):
-                        m.d.sync += self.srst_o.eq(out_fifo.r_data - ord(b"r"))
-                    # remote_bitbang_blink(int on)
-                    with m.Case(*b"Bb"):
-                        m.d.sync += blink.eq(~out_fifo.r_data[5])
-                    # new extension: wait a cycle
-                    with m.Case(*b"w"):
-                        m.d.sync += timer.eq(self.period_cyc - 1)
-                    with m.Default():
-                        # Hang if an unknown command is received.
-                        m.d.comb += out_fifo.r_en.eq(0)
+
+        with m.FSM() as fsm:
+            with m.State("RECV-COMMAND"):
+                m.d.comb += in_fifo.flush.eq(1)
+                with m.If(out_fifo.r_rdy):
+                    m.d.comb += out_fifo.r_en.eq(1)
+                    m.d.sync += cmd_plus_flags.eq(out_fifo.r_data)
+                    m.d.sync += seq_counter.eq(0)
+
+                    m.next = "COMMAND"
+
+            with m.State("COMMAND"):
+                with m.If(cmd_only == CMD_TURNAROUND):
+                    m.next = "TURNAROUND"
+                with m.Elif((cmd_only == CMD_SWD_IN) | (cmd_only == CMD_SWD_OUT)):
+                    m.next = "RECV-LENGTH"
+                with m.Elif(cmd_only == CMD_SWD_GPIO):
+                    m.next = "SET-IO"
+                with m.Else():
+                    m.next = "RECV-COMMAND"
+
+            with m.State("RECV-LENGTH"):
+                with m.If(out_fifo.r_rdy):
+                    m.d.comb += out_fifo.r_en.eq(1)
+
+                    with m.If(cmd_only == CMD_SWD_OUT):
+                        m.d.sync += bus.swdio_o.eq(0)
+
+                        m.d.sync += seq_length.eq(out_fifo.r_data)
+                        m.d.sync += seq_length_counter.eq(out_fifo.r_data)
+                        m.next = "RECV-DATA"
+                    with m.Elif(cmd_only == CMD_SWD_IN):
+                        m.d.sync += seq_length.eq(out_fifo.r_data)
+                        m.d.sync += seq_length_counter.eq(out_fifo.r_data)
+
+                        m.d.sync += timer.eq(self.period_cyc)
+                        m.next = "CLOCK-RISE"
+
+            with m.State("RECV-DATA"):
+                with m.If(out_fifo.r_rdy):
+                    m.d.comb += out_fifo.r_en.eq(1)
+                    m.d.sync += seq_data.bit_select(seq_counter * 8,8).eq(out_fifo.r_data)
+
+                    m.d.sync += seq_counter.eq(seq_counter+1)
+                    with m.If(seq_counter == 3):
+                        m.next = "OUT-SEQ"
+
+            with m.State("TURNAROUND"):
+                with m.If(cmd_plus_flags == (CMD_TURNAROUND | TURNAROUND_IN)):
+                    m.d.sync += bus.swdio_z.eq(1)
+
+                m.d.sync += timer.eq(self.period_cyc)
+                m.next = "CLOCK-RISE"
+
+            with m.State("IN-SEQ"):
+                m.d.sync += timer.eq(self.period_cyc)
+                with m.If(seq_length_counter == 0):
+                    # todo: fold adjust into this
+                    m.d.sync += seq_data.eq((seq_data >> 1) | (in_bit << 31))
+                    m.next = "IN-SEQ-ADJUST"
+                with m.Else():
+                    m.d.sync += seq_data.eq((seq_data >> 1) | (in_bit << 31))
+                    m.next = "CLOCK-RISE"
+
+            with m.State("IN-SEQ-ADJUST"):
+                m.d.sync += seq_data.eq(seq_data >> (32-seq_length).as_unsigned())
+                m.next = "IN-SEQ-UPLOAD"
+
+            with m.State("IN-SEQ-UPLOAD"):
+                with m.If(in_fifo.w_rdy):
+                    m.d.comb += in_fifo.w_en.eq(1)
+                    m.d.comb += in_fifo.w_data.eq(seq_data.bit_select(seq_counter*8, 8))
+                    m.d.sync += seq_counter.eq(seq_counter+1)
+
+                    with m.If(seq_counter == 3):
+                        m.next = "RECV-COMMAND"
+
+            with m.State("OUT-SEQ"):
+                with m.If(seq_length_counter == 0):
+                    m.next = "RECV-COMMAND"
+                with m.Else():
+                    m.d.sync += seq_data.eq(seq_data >> 1)
+                    m.d.sync += bus.swdio_o.eq(seq_data & 1)
+                    m.d.sync += seq_length_counter.eq(seq_length_counter - 1)
+
+                    m.d.sync += timer.eq(self.period_cyc)
+                    m.next = "CLOCK-RISE"
+
+            with m.State("CLOCK-RISE"):
+                with m.If(timer != 0):
+                    m.d.sync += timer.eq(timer-1)
+                with m.Else():
+                    with m.If(cmd_only == CMD_SWD_IN):
+                        m.d.sync += in_bit.eq(bus.swdio_i)
+                    m.d.sync += bus.swclk.eq(1)
+                    m.d.sync += timer.eq(self.period_cyc)
+                    m.next = "CLOCK-FALL"
+
+            with m.State("CLOCK-FALL"):
+                with m.If(timer != 0):
+                    m.d.sync += timer.eq(timer-1)
+                with m.Else():
+                    m.d.sync += bus.swclk.eq(0)
+                    with m.If(cmd_plus_flags == (CMD_TURNAROUND | TURNAROUND_OUT)):
+                        m.d.sync += bus.swdio_z.eq(0)
+                        m.next = "RECV-COMMAND"
+                    with m.Elif(cmd_only == CMD_SWD_IN):
+                        m.d.sync += seq_length_counter.eq(seq_length_counter-1)
+                        m.next = "IN-SEQ"
+                    with m.Elif(cmd_only == CMD_SWD_OUT):
+                        m.next = "OUT-SEQ"
+                    with m.Else():
+                        m.next = "RECV-COMMAND"
+
+            with m.State("SET-IO"):
+                # nrst, led?
+                pass
+
 
         return m
-
-SWDIO_READ = b"c"
-SWCLK_LOW = b"d"
-SWCLK_HIGH = b"e"
-SWDIO_LOW = b"f"
-SWDIO_HIGH = b"g"
-WAIT = b"w"
-SWDIO_FLOAT = b"o"
-SWDIO_DRIVE = b"O"
 
 
 class SWDInterface:
@@ -142,9 +240,9 @@ class SWDInterface:
         self.line_dir = newdir
 
         if not newdir:
-            await self.lower.write(b"".join([SWDIO_FLOAT, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
+            await self.lower.write([CMD_TURNAROUND | TURNAROUND_IN])
         else:
-            await self.lower.write(b"".join([WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW, SWDIO_DRIVE]))
+            await self.lower.write([CMD_TURNAROUND | TURNAROUND_OUT])
 
     async def get_nrst(self):
         return self.nrst
@@ -153,60 +251,44 @@ class SWDInterface:
     async def set_nrst(self, state):
         if state:
             self.nrst = True
-            await self.lower.write(b"r")
+            #await self.lower.write(b"r")
         else:
             self.nrst = False
-            await self.lower.write(b"s")
+            #await self.lower.write(b"s")
 
     async def set_led(self, state):
         if state:
-            await self.lower.write(b"B")
+            pass
+            #await self.lower.write(b"B")
         else:
-            await self.lower.write(b"b")
+            pass
+            #await self.lower.write(b"b")
     
     async def swd_out(self, num_clocks, data, parity=False):
         await self.turnaround(True)
+        await self.lower.write(struct.pack("<BBI", CMD_SWD_OUT, num_clocks, data))
 
-        for i in range(0, num_clocks):
-            if data & (1<<i):
-                await self.lower.write(b"".join([SWDIO_HIGH, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
-            else:
-                await self.lower.write(b"".join([SWDIO_LOW, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
-
+        # parity isnt real, it can't hurt me
         # Write parity bit
-        if parity:
-            if (data.bit_count() & 1) == 1:
-                await self.lower.write(b"".join([SWDIO_HIGH, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
-            else:
-                await self.lower.write(b"".join([SWDIO_LOW, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
+        #if parity:
+        #    if (data.bit_count() & 1) == 1:
+        #        await self.lower.write(b"".join([SWDIO_HIGH, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
+        #    else:
+        #        await self.lower.write(b"".join([SWDIO_LOW, WAIT, SWCLK_HIGH, WAIT, SWCLK_LOW]))
 
-        await self.lower.flush()
+        #await self.lower.flush()
 
     async def swd_in(self, num_clocks, parity=False):
         # SWD: in %02x clocks
         await self.turnaround(False)
-
-        num_clocks_with_parity = num_clocks
-        if parity:
-            num_clocks_with_parity = num_clocks + 1
-
-        await self.lower.write(b"".join([WAIT, SWDIO_READ, SWCLK_HIGH, WAIT, SWCLK_LOW]) * num_clocks_with_parity)
-
-        data_u32 = 0
-        data = await self.lower.read(num_clocks_with_parity)
-
-        # TODO: i am pretty sure this is just a bit reverse
-        for i in range(0, num_clocks):
-            data_u32 >>= 1
-            if data[i] == b"1"[0]:
-                data_u32 |= (1<<31)
-        data_u32 >>= (32-num_clocks)
+        await self.lower.write(struct.pack("<BB", CMD_SWD_IN, num_clocks))
+        data_u32 = struct.unpack("<I", await self.lower.read(4))[0]
 
         if parity:
             await self.turnaround(True)
-            if (data_u32.bit_count() & 1) != (data[num_clocks] & 1):
-                # Parity error
-                return (True, data_u32)
+            #if (data_u32.bit_count() & 1) != (data[num_clocks] & 1):
+            #    # Parity error
+            #    return (True, data_u32)
         return (False, data_u32)
 
 class SWDBlackmagicRemote(BlackmagicRemote):
